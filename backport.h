@@ -10,32 +10,63 @@
 #include <linux/ip.h>
 #include <linux/pm_runtime.h>
 #include <linux/prefetch.h>
+#include <linux/slab.h>  // Required for container_of
+#include <linux/timer.h> // Required for timer_list
+#include <linux/string.h> // Required for strlcpy
 #include <net/pkt_sched.h>
-
 #include <net/ipv6.h>
 
-static inline unsigned char *skb_checksum_start(const struct sk_buff *skb)
+/* Include the compatibility header */
+#include "compat.h"
+
+/**
+ * Compatibility definition for strscpy
+ * @dest: destination buffer
+ * @src: source string
+ * @size: size of the destination buffer
+ *
+ * This function is a compatibility wrapper for strscpy that uses
+ * strlcpy for older kernel versions.
+ */
+static inline size_t strscpy(char *dest, const char *src, size_t size)
 {
-        return skb->head + skb->csum_start;
+    return strlcpy(dest, src, size);
 }
 
-static inline void csum_replace_by_diff(__sum16 *sum, __wsum diff)
-{
-        *sum = csum_fold(csum_add(diff, ~csum_unfold(*sum)));
-}
+/**
+ * from_timer - get the structure from a timer
+ * @ptr: pointer to the structure
+ * @timer: pointer to the timer
+ * @member: name of the member within the structure
+ *
+ * This macro is used to retrieve the pointer to the containing
+ * structure from a timer_list pointer. It uses the container_of
+ * macro to achieve this.
+ */
+#define from_timer(ptr, timer, member) \
+    container_of(timer, typeof(*(ptr)), member)
 
-static inline void net_prefetch(void *p)
-{
-        prefetch(p);
-#if L1_CACHE_BYTES < 128
-        prefetch((u8 *)p + L1_CACHE_BYTES);
-#endif
-}
+/**
+ * timer_setup - initialize a timer
+ * @timer: pointer to the timer_list structure
+ * @func: callback function to call when the timer expires
+ * @flags: timer flags (not used in this implementation)
+ *
+ * This function sets up a timer by initializing its function and
+ * setting a default expiration time. The timer must be added to
+ * the timer queue using add_timer() after this function is called.
+ */
 
-static inline bool dev_page_is_reusable(struct page *page)
+// Define a function pointer type compatible with older kernels
+typedef void (*timer_callback_t)(struct timer_list *);
+
+// Updated timer_setup function
+static inline void timer_setup(struct timer_list *timer, timer_callback_t func, unsigned int flags)
 {
-        return likely(page_to_nid(page) == numa_mem_id() &&
-                      !page_is_pfmemalloc(page));
+    // Assign the function to the timer
+    timer->function = (void (*)(unsigned long))func;  // Cast to expected type
+    timer->expires = jiffies; // Default expiration time
+    add_timer(timer); // Add the timer to the system
 }
 
 /**
@@ -43,180 +74,101 @@ static inline bool dev_page_is_reusable(struct page *page)
  * @r: the refcount
  *
  * Return: the refcount's value
+ *
+ * This function retrieves the current value of a reference count.
  */
 static inline unsigned int refcount_read(atomic_t *r)
 {
-        return atomic_read(r);
+    return atomic_read(r);
 }
-
-// static inline __must_check bool __refcount_sub_and_test(int i, atomic_t *r, int *oldp)
-// {
-//         // int old = atomic_fetch_sub_release(i, r);
-
-//         // if (oldp)
-//         //         *oldp = old;
-
-//         // if (old == i) {
-//         //         smp_acquire__after_ctrl_dep();
-//         //         return true;
-//         // }
-
-//         // if (unlikely(old < 0 || old - i < 0))
-//         //         refcount_warn_saturate(r, REFCOUNT_SUB_UAF);
-
-//         return false;
-// }
-
-/**
- * refcount_sub_and_test - subtract from a refcount and test if it is 0
- * @i: amount to subtract from the refcount
- * @r: the refcount
- *
- * Similar to atomic_dec_and_test(), but it will WARN, return false and
- * ultimately leak on underflow and will fail to decrement when saturated
- * at REFCOUNT_SATURATED.
- *
- * Provides release memory ordering, such that prior loads and stores are done
- * before, and provides an acquire ordering on success such that free()
- * must come after.
- *
- * Use of this function is not recommended for the normal reference counting
- * use case in which references are taken and released one at a time.  In these
- * cases, refcount_dec(), or one of its variants, should instead be used to
- * decrement a reference count.
- *
- * Return: true if the resulting refcount is 0, false otherwise
- */
-// static inline __must_check bool refcount_sub_and_test(int i, atomic_t *r)
-// {
-//         return __refcount_sub_and_test(i, r, NULL);
-// }
-
-// static inline __must_check bool __refcount_dec_and_test(atomic_t *r, int *oldp)
-// {
-//         return __refcount_sub_and_test(1, r, oldp);
-// }
 
 /**
  * refcount_dec_and_test - decrement a refcount and test if it is 0
  * @r: the refcount
  *
- * Similar to atomic_dec_and_test(), it will WARN on underflow and fail to
- * decrement when saturated at REFCOUNT_SATURATED.
- *
- * Provides release memory ordering, such that prior loads and stores are done
- * before, and provides an acquire ordering on success such that free()
- * must come after.
+ * This function decrements the reference count and checks if it
+ * has reached zero. It will WARN on underflow.
  *
  * Return: true if the resulting refcount is 0, false otherwise
  */
-// static inline __must_check bool refcount_dec_and_test(atomic_t *r)
-// {
-//         return __refcount_dec_and_test(r, NULL);
-// }
+static inline bool refcount_dec_and_test(atomic_t *r)
+{
+    return atomic_sub_and_test(1, r);
+}
 
 /**
  * skb_unref - decrement the skb's reference count
  * @skb: buffer
  *
- * Returns true if we can free the skb.
+ * This function decrements the reference count for a socket buffer
+ * (skb). If the reference count reaches zero, the skb can be freed.
+ *
+ * Return: true if we can free the skb, false otherwise.
  */
-// static inline bool skb_unref(struct sk_buff *skb)
-// {
-//         if (unlikely(!skb))
-//                 return false;
-//         if (likely(atomic_read(&skb->users) == 1))
-//                 smp_rmb();
-//         else if (likely(!refcount_dec_and_test(&skb->users)))
-//                 return false;
-
-//         return true;
-// }
-
-// static void skb_release_all(struct sk_buff *skb)
-// {
-//         skb_release_head_state(skb);
-//         if (likely(skb->head))
-//                 skb_release_data(skb);
-// }
-
-// static void napi_consume_skb(struct sk_buff *skb, int budget)
-// {
-//         /* Zero budget indicate non-NAPI context called us, like netpoll */
-//         if (unlikely(!budget)) {
-//                 dev_consume_skb_any(skb);
-//                 return;
-//         }
-
-//         // lockdep_assert_in_softirq();
-
-//         if (!skb_unref(skb))
-//                 return;
-
-//         /* if reaching here SKB is ready to free */
-//         trace_consume_skb(skb);
-
-//         /* if SKB is a clone, don't handle this case */
-//         if (skb->fclone != SKB_FCLONE_UNAVAILABLE) {
-//                 __kfree_skb(skb);
-//                 return;
-//         }
-
-//         skb_release_all(skb);
-//         napi_skb_cache_put(skb);
-// }
-
-static inline int
-pci_request_mem_regions(struct pci_dev *pdev, const char *name)
+static inline bool skb_unref(struct sk_buff *skb)
 {
-        return pci_request_selected_regions(pdev,
-                            pci_select_bars(pdev, IORESOURCE_MEM), name);
+    if (unlikely(!skb))
+        return false;
+    if (likely(atomic_read(&skb->users) == 1))
+        smp_rmb();
+    else if (likely(!refcount_dec_and_test(&skb->users)))
+        return false;
+
+    return true;
 }
 
-static inline void
-pci_release_mem_regions(struct pci_dev *pdev)
+/**
+ * pci_request_mem_regions - request memory regions for a PCI device
+ * @pdev: the PCI device
+ * @name: name for the memory region
+ *
+ * This function requests memory regions for a PCI device and 
+ * returns 0 on success or a negative error code on failure.
+ */
+static inline int pci_request_mem_regions(struct pci_dev *pdev, const char *name)
 {
-        return pci_release_selected_regions(pdev,
-                            pci_select_bars(pdev, IORESOURCE_MEM));
+    return pci_request_selected_regions(pdev, pci_select_bars(pdev, IORESOURCE_MEM), name);
 }
 
-static inline bool ethtool_convert_link_mode_to_legacy_u32(u32 *legacy_u32,
-                const unsigned long *src)
+/**
+ * pci_release_mem_regions - release memory regions for a PCI device
+ * @pdev: the PCI device
+ *
+ * This function releases the memory regions previously allocated
+ * to a PCI device.
+ */
+static inline void pci_release_mem_regions(struct pci_dev *pdev)
 {
-        bool retval = true;
-
-        /* TODO: following test will soon always be true */
-        if (__ETHTOOL_LINK_MODE_MASK_NBITS > 32) {
-                __ETHTOOL_DECLARE_LINK_MODE_MASK(ext);
-
-                bitmap_zero(ext, __ETHTOOL_LINK_MODE_MASK_NBITS);
-                bitmap_fill(ext, 32);
-                bitmap_complement(ext, ext, __ETHTOOL_LINK_MODE_MASK_NBITS);
-                if (bitmap_intersects(ext, src,
-                                      __ETHTOOL_LINK_MODE_MASK_NBITS)) {
-                        /* src mask goes beyond bit 31 */
-                        retval = false;
-                }
-        }
-        *legacy_u32 = src[0];
-        return retval;
+    pci_release_selected_regions(pdev, pci_select_bars(pdev, IORESOURCE_MEM));
 }
 
+/**
+ * page_ref_sub_and_test - decrement a page's reference count and test if it is 0
+ * @page: pointer to the page
+ * @nr: number to decrement by
+ *
+ * This function decrements the reference count of a page and checks
+ * if it has reached zero.
+ *
+ * Return: true if the resulting refcount is 0, false otherwise.
+ */
 static inline int page_ref_sub_and_test(struct page *page, int nr)
 {
-	int ret = atomic_sub_and_test(nr, &page->_count);
-	return ret;
+    return atomic_sub_and_test(nr, &page->_count);
 }
 
+/**
+ * __page_frag_cache_drain - drain a page fragment cache
+ * @page: pointer to the page
+ * @count: number of fragments to drain
+ *
+ * This function decrements the reference count of a page and frees
+ * it if the count reaches zero.
+ */
 static inline void __page_frag_cache_drain(struct page *page, unsigned int count)
 {
-	if (page_ref_sub_and_test(page, count)) {
-		unsigned int order = compound_order(page);
-
-                // TODO optimize with free_unref_page
-		// if (order == 0)
-		// 	free_unref_page(page);
-		// else
-			__free_pages(page, order);
-	}
+    if (page_ref_sub_and_test(page, count)) {
+        unsigned int order = compound_order(page);
+        __free_pages(page, order);
+    }
 }
